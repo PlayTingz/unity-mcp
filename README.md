@@ -169,7 +169,7 @@ If Auto-Configure fails or you use a different client:
     
 2. **Start your MCP Client** (Claude, Cursor, etc.). It should automatically launch the Unity MCP Server (Python) using the configuration from Installation Step 3.
     
-3. **Interact!** Unity tools should now be available in your MCP Client.
+3. **Interact!** Unity tools should now be available in your MCP Client. You should see a hammer symbol, if everything worked.
     
     Example Prompt: `Create a 3D player controller.`
     
