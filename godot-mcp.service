@@ -1,0 +1,18 @@
+[Unit]
+Description=Godot MCP Build Service
+After=network.target nginx.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/unity-mcp/server
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/opt/unity-mcp/server"
+ExecStart=/usr/bin/python3 /opt/unity-mcp/server/production_godot_service.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
