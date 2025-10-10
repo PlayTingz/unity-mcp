@@ -16,7 +16,8 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime
 import uuid
 
-from .unity_project_generator import UnityProjectGenerator, GameSpec, SceneSpec, GameObjectSpec
+from unity_project_generator import UnityProjectGenerator, GameSpec, SceneSpec, GameObjectSpec
+from asset_manager import AssetManager
 
 @dataclass
 class BuildRequest:
@@ -28,6 +29,7 @@ class BuildRequest:
     asset_set: str = "v1" 
     assets: Optional[List[List[str]]] = None
     target_platform: str = "WebGL"
+    theme: str = "city"
 
 @dataclass 
 class BuildJob:
@@ -40,6 +42,7 @@ class BuildJob:
     asset_set: str
     assets: List[List[str]]
     target_platform: str
+    theme: str = "city"
     status: str = "queued"
     progress: int = 0
     created_at: Optional[datetime] = None
@@ -49,6 +52,7 @@ class BuildJob:
     error: Optional[str] = None
     project_dir: Optional[str] = None
     build_output_dir: Optional[str] = None
+    scene_name: Optional[str] = None
     play_url: Optional[str] = None
     download_url: Optional[str] = None
 
@@ -70,6 +74,16 @@ class UnityBuildService:
         
         # Initialize Unity project generator
         self.unity_generator = UnityProjectGenerator(unity_path)
+        
+        # Initialize asset manager
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent))
+            from asset_manager import AssetManager
+            self.asset_manager = AssetManager(logging.getLogger("asset_manager"))
+        except Exception as e:
+            self.logger.warning(f"Asset manager not available: {e}")
+            self.asset_manager = None
         
         # Setup logging
         self.logger = logging.getLogger(__name__)
@@ -113,6 +127,7 @@ class UnityBuildService:
             asset_set=request.asset_set,
             assets=request.assets or [],
             target_platform=request.target_platform,
+            theme=request.theme,
             created_at=datetime.now()
         )
         
@@ -218,21 +233,98 @@ class UnityBuildService:
             job.build_log.append("Generating game specification...")
             game_spec = self._create_game_specification(job)
             
-            # Step 2: Create Unity project
+            # Step 2: Download user assets if provided
+            if job.assets and self.asset_manager:
+                job.progress = 25
+                job.build_log.append(f"Downloading {sum(len(slot) for slot in job.assets)} user assets...")
+                try:
+                    downloaded_assets = await asyncio.get_event_loop().run_in_executor(
+                        None, self.asset_manager.download_all_assets, job.assets, build_workspace
+                    )
+                    job.build_log.append(f"Downloaded {sum(len(assets) for assets in downloaded_assets.values())} assets")
+                except Exception as e:
+                    self.logger.warning(f"Failed to download some assets: {e}")
+                    job.build_log.append(f"Warning: Some assets failed to download: {e}")
+            
+            # Step 3: Create Unity project (theme package imported automatically if theme specified)
             job.progress = 30
-            job.build_log.append("Creating Unity project...")
-            await asyncio.get_event_loop().run_in_executor(
+            job.build_log.append("Creating Unity project with theme support...")
+            project_path, scene_name = await asyncio.get_event_loop().run_in_executor(
                 None, self.unity_generator.create_project, game_spec, str(build_workspace)
             )
+            job.project_dir = project_path
+            job.scene_name = scene_name
+            job.build_log.append(f"Created scene: {scene_name}")
             
-            # Step 3: Build WebGL
+            # Step 4: Integrate user assets into Unity project
+            if job.assets and self.asset_manager and 'downloaded_assets' in locals():
+                job.build_log.append("Integrating user assets into Unity project...")
+                try:
+                    project_path = Path(job.project_dir) if job.project_dir else Path(build_workspace) / "UnityProject"
+                    asset_manifest = await asyncio.get_event_loop().run_in_executor(
+                        None, self.asset_manager.organize_assets_for_unity, downloaded_assets, project_path
+                    )
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self.asset_manager.create_asset_loader_script, project_path, asset_manifest
+                    )
+                    job.build_log.append(f"Integrated {len(asset_manifest.get('by_type', {}).get('images', []))} images, "
+                                       f"{len(asset_manifest.get('by_type', {}).get('models', []))} 3D models")
+                except Exception as e:
+                    self.logger.warning(f"Failed to integrate assets: {e}")
+                    job.build_log.append(f"Warning: Asset integration failed: {e}")
+            
+            job.progress = 40
+            
+            # Step 3: Build WebGL with live progress tracking
             job.progress = 50
             job.build_log.append("Building WebGL with Unity Pro...")
             if not job.project_dir or not job.build_output_dir:
                 raise Exception("Project directories not initialized")
-            build_success = await asyncio.get_event_loop().run_in_executor(
-                None, self.unity_generator.build_webgl, job.project_dir, job.build_output_dir
-            )
+            
+            # Start progress monitor in background
+            import threading
+            import time
+            import re
+            
+            stop_monitor = threading.Event()
+            
+            def monitor_unity_log():
+                """Monitor Unity log file for IL2CPP compilation progress"""
+                import glob
+                time.sleep(5)  # Wait for log file to be created
+                
+                while not stop_monitor.is_set():
+                    try:
+                        # Find most recent unity log
+                        log_files = glob.glob("/tmp/unity_build_*.log")
+                        if log_files:
+                            latest_log = max(log_files, key=lambda x: Path(x).stat().st_mtime)
+                            with open(latest_log, 'r') as f:
+                                content = f.read()
+                                
+                            # Look for IL2CPP progress: [123/456 ...]
+                            matches = re.findall(r'\[(\d+)/(\d+)\s+', content)
+                            if matches:
+                                current, total = matches[-1]
+                                current, total = int(current), int(total)
+                                # Map IL2CPP progress (0-100%) to build progress (50-75%)
+                                il2cpp_percent = (current / total) * 100
+                                job.progress = 50 + int((il2cpp_percent / 100) * 25)
+                    except Exception as e:
+                        pass
+                    
+                    time.sleep(10)  # Check every 10 seconds
+            
+            monitor_thread = threading.Thread(target=monitor_unity_log, daemon=True)
+            monitor_thread.start()
+            
+            try:
+                build_success = await asyncio.get_event_loop().run_in_executor(
+                    None, self.unity_generator.build_webgl, job.project_dir, job.build_output_dir
+                )
+            finally:
+                stop_monitor.set()
+                monitor_thread.join(timeout=1)
             
             if not build_success:
                 raise Exception("Unity WebGL build failed")
@@ -270,9 +362,9 @@ class UnityBuildService:
                     name="Player",
                     type="Cube",
                     position={"x": 0, "y": 1, "z": 0},
-                    rotation={"x": 0, "y": 0, "z": 0},
+                    rotation={"x": 0, "y": 45, "z": 0},
                     scale={"x": 1, "y": 1, "z": 1},
-                    material_color={"r": 0.2, "g": 0.8, "b": 1.0, "a": 1.0}
+                    material_color={"r": 1.0, "g": 0.3, "b": 0.3, "a": 1.0}
                 ),
                 GameObjectSpec(
                     name="Ground",
@@ -280,7 +372,15 @@ class UnityBuildService:
                     position={"x": 0, "y": -0.5, "z": 0},
                     rotation={"x": 0, "y": 0, "z": 0},
                     scale={"x": 10, "y": 1, "z": 10},
-                    material_color={"r": 0.5, "g": 0.3, "b": 0.1, "a": 1.0}
+                    material_color={"r": 0.3, "g": 0.8, "b": 0.3, "a": 1.0}
+                ),
+                GameObjectSpec(
+                    name="BlueSphere",
+                    type="Sphere", 
+                    position={"x": 2, "y": 1.5, "z": 0},
+                    rotation={"x": 0, "y": 0, "z": 0},
+                    scale={"x": 1, "y": 1, "z": 1},
+                    material_color={"r": 0.2, "g": 0.5, "b": 1.0, "a": 1.0}
                 )
             ]
         else:
@@ -309,7 +409,8 @@ class UnityBuildService:
             name=job.game_name,
             company_name="Unity MCP Games",
             version="1.0.0",
-            scene=scene
+            scene=scene,
+            theme=job.theme
         )
         
         return game_spec

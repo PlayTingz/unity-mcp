@@ -1,0 +1,19 @@
+{
+  "user_id": "019985a1-3ab2-737f-a7b3-d26178612233",
+  "game_id": "asset-test-game-001",
+  "game_name": "UserAssetTest",
+  "game_type": "3d",
+  "theme": "city",
+  "assets": [
+    [
+      "https://zzukvfvsascjizivlszo.supabase.co/storage/v1/object/public/image-tingz/user_123/project_1758802451378_lpiqxio99/z760je/c3rdy5r829rge0csjr3sp8x0tr_1_0.png",
+      "https://zzukvfvsascjizivlszo.supabase.co/storage/v1/object/public/image-tingz/user_123/project_1758802451378_lpiqxio99/rlcsoe/f31r97t1c1rge0csjqw8anxyd0_1_2.png"
+    ],
+    [
+      "https://zzukvfvsascjizivlszo.supabase.co/storage/v1/object/image-tingz/user_123/project_1758804683638_4z4vhjjjk/enhebe/4x7cj0tkadrme0csg3qvqqtcqr_1_0_3d.glb",
+      "https://zzukvfvsascjizivlszo.supabase.co/storage/v1/object/image-tingz/user_123/project_1758802451378_lpiqxio99/7vz5el/xhh3tx9hc1rm80csg3b8ddc3w4_1_1_3d.glb",
+      "https://zzukvfvsascjizivlszo.supabase.co/storage/v1/object/image-tingz/user_123/project_1758802451378_lpiqxio99/83f8y5/xkgthtqt55rmc0csg3f95mcb7r_1_2_3d.glb"
+    ]
+  ],
+  "target_platform": "WebGL"
+}

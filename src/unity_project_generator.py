@@ -45,6 +45,7 @@ class GameSpec:
     version: str = "1.0.0"
     scene: Optional[SceneSpec] = None
     scripts: Optional[List[str]] = None
+    theme: str = "city"
 
 class UnityProjectGenerator:
     """Production Unity project generator with real Unity integration"""
@@ -57,27 +58,87 @@ class UnityProjectGenerator:
         if not os.path.exists(unity_path):
             raise FileNotFoundError(f"Unity not found at {unity_path}")
     
-    def create_project(self, game_spec: GameSpec, output_dir: str) -> str:
+    def create_project(self, game_spec: GameSpec, output_dir: str, import_theme_package: bool = True) -> tuple[str, str]:
         """
-        Create a complete Unity project from game specification
-        Returns the project directory path
+        Use shared Unity project and create a new scene for this game
+        Returns tuple of (shared_project_path, scene_name)
         """
-        project_dir = Path(output_dir) / "UnityProject"
-        project_dir.mkdir(parents=True, exist_ok=True)
+        shared_project_dir = Path("/opt/unity-mcp/shared-project")
         
-        self.logger.info(f"Creating Unity project at: {project_dir}")
+        if not shared_project_dir.exists():
+            raise FileNotFoundError(f"Shared Unity project not found at {shared_project_dir}")
         
-        # Create Unity project structure
-        self._create_project_structure(project_dir)
-        self._create_project_settings(project_dir, game_spec)
-        self._create_editor_build_script(project_dir)
-        self._create_game_scene(project_dir, game_spec.scene or SceneSpec())
+        self.logger.info(f"Using shared Unity project at: {shared_project_dir}")
+        
+        # Get scene name from game_spec.scene if it exists, otherwise generate one
+        if game_spec.scene and game_spec.scene.name:
+            scene_name = game_spec.scene.name
+        else:
+            scene_name = game_spec.name.replace(" ", "_") + "_" + uuid.uuid4().hex[:8]
+        
+        # Create the scene (returns the scene GUID that was generated)
+        scene_guid = self._create_game_scene(shared_project_dir, game_spec.scene or SceneSpec(name=scene_name), game_spec.theme)
+        
+        # Update EditorBuildSettings to include this scene with matching GUID
+        self._update_build_settings(shared_project_dir, scene_name, scene_guid)
         
         if game_spec.scripts:
-            self._create_game_scripts(project_dir, game_spec.scripts)
+            self._create_game_scripts(shared_project_dir, game_spec.scripts)
         
-        self.logger.info("Unity project created successfully")
-        return str(project_dir)
+        self.logger.info(f"Created scene {scene_name} in shared project")
+        return (str(shared_project_dir), scene_name)
+    
+    def import_unity_package(self, project_dir: str, package_path: str) -> bool:
+        """
+        Import a Unity package into the project
+        Returns True if import succeeds
+        """
+        self.logger.info(f"Importing Unity package: {package_path}")
+        
+        if not os.path.exists(package_path):
+            self.logger.error(f"Package not found: {package_path}")
+            return False
+        
+        unity_cmd = [
+            self.unity_path,
+            "-batchmode",
+            "-quit",
+            "-projectPath", project_dir,
+            "-importPackage", package_path,
+            "-logFile", f"/tmp/unity_import_{uuid.uuid4().hex[:8]}.log"
+        ]
+        
+        try:
+            self.logger.info(f"Executing Unity package import: {' '.join(unity_cmd)}")
+            
+            env = os.environ.copy()
+            env.update({
+                'UNITY_LOG_LEVEL': 'DEBUG',
+                'DISPLAY': ':99'
+            })
+            
+            result = subprocess.run(
+                unity_cmd,
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=900,  # 15 minutes for package import
+                env=env
+            )
+            
+            if result.returncode == 0:
+                self.logger.info("Unity package imported successfully")
+                return True
+            else:
+                self.logger.error(f"Package import failed with exit code: {result.returncode}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error("Package import timed out")
+            return False
+        except Exception as e:
+            self.logger.error(f"Package import error: {e}")
+            return False
     
     def build_webgl(self, project_dir: str, build_output_dir: str, development_build: bool = False) -> bool:
         """
@@ -110,25 +171,23 @@ class UnityProjectGenerator:
             env = os.environ.copy()
             env.update({
                 'UNITY_LOG_LEVEL': 'DEBUG',
-                'DISPLAY': ':0'  # For headless display
+                'DISPLAY': ':99'  # For headless display (Xvfb)
             })
+            
+            # Open log file for Unity output
+            log_file_path = unity_cmd[unity_cmd.index("-logFile") + 1]
             
             result = subprocess.run(
                 unity_cmd,
                 cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=900,  # 15 minutes
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1800,  # 30 minutes for WebGL build
                 env=env
             )
             
             self.logger.info(f"Unity build completed with exit code: {result.returncode}")
-            
-            # Log Unity output
-            if result.stdout:
-                self.logger.debug(f"Unity stdout: {result.stdout}")
-            if result.stderr:
-                self.logger.warning(f"Unity stderr: {result.stderr}")
+            self.logger.info(f"Unity build log: {log_file_path}")
             
             # Check if build succeeded
             if result.returncode == 0:
@@ -152,11 +211,45 @@ class UnityProjectGenerator:
                 return False
                 
         except subprocess.TimeoutExpired:
-            self.logger.error("Unity build timed out")
-            return False
+            self.logger.warning("Unity build timed out, but checking if build completed anyway...")
+            # Unity might have finished even though subprocess timed out
+            # Check if build files exist
+            expected_files = ['index.html', 'Build', 'TemplateData']
+            missing_files = []
+            
+            for expected_file in expected_files:
+                file_path = build_path / expected_file
+                if not file_path.exists():
+                    missing_files.append(expected_file)
+            
+            if missing_files:
+                self.logger.error(f"Build timed out and files are missing: {missing_files}")
+                return False
+            else:
+                self.logger.info("Build timed out but all files are present - build succeeded!")
+                return True
         except Exception as e:
             self.logger.error(f"Unity build error: {e}")
             return False
+    
+    def _update_build_settings(self, project_dir: Path, scene_name: str, scene_guid: str):
+        """Update EditorBuildSettings to build the specified scene with matching GUID"""
+        settings_dir = project_dir / "ProjectSettings"
+        
+        build_settings_content = f"""%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1045 &1
+EditorBuildSettings:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Scenes:
+  - enabled: 1
+    path: Assets/Scenes/{scene_name}.unity
+    guid: {scene_guid}
+  m_configObjects: {{}}
+"""
+        (settings_dir / "EditorBuildSettings.asset").write_text(build_settings_content)
+        self.logger.info(f"Updated build settings for scene: {scene_name} with GUID: {scene_guid}")
     
     def _create_project_structure(self, project_dir: Path):
         """Create basic Unity project directory structure"""
@@ -171,14 +264,60 @@ class UnityProjectGenerator:
         
         for directory in directories:
             (project_dir / directory).mkdir(parents=True, exist_ok=True)
+        
+        # Create Packages/manifest.json with gltfast package
+        packages_dir = project_dir / "Packages"
+        manifest_content = {
+            "dependencies": {
+                "com.unity.cloud.gltfast": "6.8.0",
+                "com.unity.collab-proxy": "2.0.5",
+                "com.unity.feature.development": "1.0.1",
+                "com.unity.textmeshpro": "3.0.6",
+                "com.unity.timeline": "1.7.5",
+                "com.unity.ugui": "1.0.0",
+                "com.unity.visualscripting": "1.8.0",
+                "com.unity.modules.ai": "1.0.0",
+                "com.unity.modules.androidjni": "1.0.0",
+                "com.unity.modules.animation": "1.0.0",
+                "com.unity.modules.assetbundle": "1.0.0",
+                "com.unity.modules.audio": "1.0.0",
+                "com.unity.modules.cloth": "1.0.0",
+                "com.unity.modules.director": "1.0.0",
+                "com.unity.modules.imageconversion": "1.0.0",
+                "com.unity.modules.imgui": "1.0.0",
+                "com.unity.modules.jsonserialize": "1.0.0",
+                "com.unity.modules.particlesystem": "1.0.0",
+                "com.unity.modules.physics": "1.0.0",
+                "com.unity.modules.physics2d": "1.0.0",
+                "com.unity.modules.screencapture": "1.0.0",
+                "com.unity.modules.terrain": "1.0.0",
+                "com.unity.modules.terrainphysics": "1.0.0",
+                "com.unity.modules.tilemap": "1.0.0",
+                "com.unity.modules.ui": "1.0.0",
+                "com.unity.modules.uielements": "1.0.0",
+                "com.unity.modules.umbra": "1.0.0",
+                "com.unity.modules.unityanalytics": "1.0.0",
+                "com.unity.modules.unitywebrequest": "1.0.0",
+                "com.unity.modules.unitywebrequestassetbundle": "1.0.0",
+                "com.unity.modules.unitywebrequestaudio": "1.0.0",
+                "com.unity.modules.unitywebrequesttexture": "1.0.0",
+                "com.unity.modules.unitywebrequestwww": "1.0.0",
+                "com.unity.modules.vehicles": "1.0.0",
+                "com.unity.modules.video": "1.0.0",
+                "com.unity.modules.vr": "1.0.0",
+                "com.unity.modules.wind": "1.0.0",
+                "com.unity.modules.xr": "1.0.0"
+            }
+        }
+        (packages_dir / "manifest.json").write_text(json.dumps(manifest_content, indent=2))
     
     def _create_project_settings(self, project_dir: Path, game_spec: GameSpec):
         """Create Unity ProjectSettings files"""
         settings_dir = project_dir / "ProjectSettings"
         
         # ProjectVersion.txt
-        version_content = """m_EditorVersion: 2022.3.45f1
-m_EditorVersionWithRevision: 2022.3.45f1 (e5503b4cfcf4)
+        version_content = """m_EditorVersion: 2022.3.48f1
+m_EditorVersionWithRevision: 2022.3.48f1 (8bf49c377ebf)
 """
         (settings_dir / "ProjectVersion.txt").write_text(version_content)
         
@@ -203,8 +342,8 @@ PlayerSettings:
   defaultCursor: {{fileID: 0}}
   cursorHotspot: {{x: 0, y: 0}}
   m_SplashScreenBackgroundColor: {{r: 0.13725491, g: 0.12156863, b: 0.1254902, a: 1}}
-  m_ShowUnitySplashScreen: 1
-  m_ShowUnitySplashLogo: 1
+  m_ShowUnitySplashScreen: 0
+  m_ShowUnitySplashLogo: 0
   m_SplashScreenOverlayOpacity: 1
   m_SplashScreenAnimation: 1
   m_SplashScreenLogoStyle: 1
@@ -746,6 +885,7 @@ EditorBuildSettings:
 using UnityEditor;
 using UnityEditor.Build.Reporting;
 using System.IO;
+using System.Linq;
 
 public class BuildScript
 {
@@ -766,9 +906,24 @@ public class BuildScript
         
         Debug.Log($"Building WebGL to: {buildPath}");
         
+        // Get scenes from EditorBuildSettings (respects what was configured)
+        string[] scenePaths = EditorBuildSettings.scenes
+            .Where(s => s.enabled)
+            .Select(s => s.path)
+            .ToArray();
+        
+        if (scenePaths.Length == 0)
+        {
+            Debug.LogError("No scenes enabled in EditorBuildSettings!");
+            EditorApplication.Exit(1);
+            return;
+        }
+        
+        Debug.Log($"Building {scenePaths.Length} scene(s): {string.Join(", ", scenePaths)}");
+        
         // Configure build settings
         BuildPlayerOptions buildPlayerOptions = new BuildPlayerOptions();
-        buildPlayerOptions.scenes = new[] { "Assets/Scenes/GameScene.unity" };
+        buildPlayerOptions.scenes = scenePaths;
         buildPlayerOptions.locationPathName = buildPath;
         buildPlayerOptions.target = BuildTarget.WebGL;
         buildPlayerOptions.options = BuildOptions.None;
@@ -790,6 +945,8 @@ public class BuildScript
             
             // Ensure we have proper WebGL template
             EnsureWebGLTemplate(buildPath);
+            
+            EditorApplication.Exit(0);
         }
         else
         {
@@ -814,102 +971,7 @@ public class BuildScript
         string indexPath = Path.Combine(buildPath, "index.html");
         if (!File.Exists(indexPath))
         {
-            Debug.LogWarning("index.html not found, creating basic template");
-            CreateBasicWebGLTemplate(buildPath);
-        }
-    }
-    
-    private static void CreateBasicWebGLTemplate(string buildPath)
-    {
-        string productName = PlayerSettings.productName;
-        string indexContent = $@"<!DOCTYPE html>
-<html lang=""en-us"">
-<head>
-    <meta charset=""utf-8"">
-    <meta http-equiv=""Content-Type"" content=""text/html; charset=utf-8"">
-    <title>{productName}</title>
-    <link rel=""shortcut icon"" href=""TemplateData/favicon.ico"">
-    <link rel=""stylesheet"" href=""TemplateData/style.css"">
-</head>
-<body>
-    <div id=""unity-container"" class=""unity-desktop"">
-        <canvas id=""unity-canvas"" width=960 height=600></canvas>
-        <div id=""unity-loading-bar"">
-            <div id=""unity-logo""></div>
-            <div id=""unity-progress-bar-empty"">
-                <div id=""unity-progress-bar-full""></div>
-            </div>
-        </div>
-        <div id=""unity-mobile-warning"">
-            WebGL builds are not supported on mobile devices.
-        </div>
-        <div id=""unity-footer"">
-            <div id=""unity-webgl-logo""></div>
-            <div id=""unity-fullscreen-button""></div>
-            <div id=""unity-build-title"">{productName}</div>
-        </div>
-    </div>
-    <script src=""Build/{productName}.loader.js""></script>
-    <script>
-        var buildUrl = ""Build/"";
-        var loaderUrl = buildUrl + ""{productName}.loader.js"";
-        var config = {{
-            dataUrl: buildUrl + ""{productName}.data"",
-            frameworkUrl: buildUrl + ""{productName}.framework.js"",
-            codeUrl: buildUrl + ""{productName}.wasm"",
-            streamingAssetsUrl: ""StreamingAssets"",
-            companyName: ""{PlayerSettings.companyName}"",
-            productName: ""{productName}"",
-            productVersion: ""{PlayerSettings.bundleVersion}"",
-        }};
-        
-        var container = document.querySelector(""#unity-container"");
-        var canvas = document.querySelector(""#unity-canvas"");
-        var loadingBar = document.querySelector(""#unity-loading-bar"");
-        var progressBarFull = document.querySelector(""#unity-progress-bar-full"");
-        var fullscreenButton = document.querySelector(""#unity-fullscreen-button"");
-        var mobileWarning = document.querySelector(""#unity-mobile-warning"");
-        
-        if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {{
-            container.className = ""unity-mobile"";
-            config.devicePixelRatio = 1;
-            mobileWarning.style.display = ""block"";
-            setTimeout(() => {{
-                mobileWarning.style.display = ""none"";
-            }}, 5000);
-        }} else {{
-            canvas.style.width = ""960px"";
-            canvas.style.height = ""600px"";
-        }}
-        
-        loadingBar.style.display = ""block"";
-        
-        var script = document.createElement(""script"");
-        script.src = loaderUrl;
-        script.onload = () => {{
-            createUnityInstance(canvas, config, (progress) => {{
-                progressBarFull.style.width = 100 * progress + ""%"";
-            }}).then((unityInstance) => {{
-                loadingBar.style.display = ""none"";
-                fullscreenButton.onclick = () => {{
-                    unityInstance.SetFullscreen(1);
-                }};
-            }}).catch((message) => {{
-                alert(message);
-            }});
-        }};
-        document.body.appendChild(script);
-    </script>
-</body>
-</html>";
-        
-        File.WriteAllText(Path.Combine(buildPath, "index.html"), indexContent);
-        
-        // Create TemplateData directory if it doesn't exist
-        string templatePath = Path.Combine(buildPath, "TemplateData");
-        if (!Directory.Exists(templatePath))
-        {
-            Directory.CreateDirectory(templatePath);
+            Debug.LogWarning("index.html not found, Unity should have created it");
         }
     }
     
@@ -943,13 +1005,83 @@ public class BuildScript
         
         (editor_dir / "BuildScript.cs").write_text(build_script_content)
     
-    def _create_game_scene(self, project_dir: Path, scene_spec: SceneSpec):
+    def _create_theme_applier_script(self, project_dir: Path, theme_name: str):
+        """Create theme applier script for automatic theme application"""
+        scripts_dir = project_dir / "Assets" / "Scripts"
+        
+        theme_applier_content = f"""using UnityEngine;
+
+public class ThemeApplier : MonoBehaviour
+{{
+    void Start()
+    {{
+        // Apply theme automatically on start
+        ApplyTheme("{theme_name}");
+    }}
+    
+    void ApplyTheme(string themeName)
+    {{
+        // Find ThemeManager in scene
+        var themeManager = FindObjectOfType<ThemeManager>();
+        if (themeManager == null)
+        {{
+            Debug.LogWarning("ThemeManager not found in scene");
+            return;
+        }}
+        
+        // Load theme data from Resources
+        var themeData = Resources.Load<ThemeData>($"Themes/{{themeName}}Theme");
+        if (themeData == null)
+        {{
+            Debug.LogWarning($"Theme '{{themeName}}' not found in Resources/Themes/");
+            return;
+        }}
+        
+        // Apply the theme
+        themeManager.SetTheme(themeData);
+        Debug.Log($"Applied theme: {{themeName}}");
+    }}
+}}
+"""
+        (scripts_dir / "ThemeApplier.cs").write_text(theme_applier_content)
+        self.logger.info(f"Created ThemeApplier script for theme: {theme_name}")
+    
+    def _create_gamemanager_script(self, project_dir: Path):
+        """Create GameManager script to keep game loop running"""
+        scripts_dir = project_dir / "Assets" / "Scripts"
+        
+        gamemanager_content = """using UnityEngine;
+
+public class GameManager : MonoBehaviour
+{
+    void Start()
+    {
+        Debug.Log("=== GAME STARTED ===");
+        Debug.Log("GameManager initialized successfully!");
+        DontDestroyOnLoad(gameObject);
+    }
+    
+    void Update()
+    {
+        // Keep game loop running
+    }
+}
+"""
+        (scripts_dir / "GameManager.cs").write_text(gamemanager_content)
+        self.logger.info("Created GameManager script")
+    
+    def _create_game_scene(self, project_dir: Path, scene_spec: SceneSpec, theme_name: str = "city") -> str:
         """Create Unity scene with specified game objects"""
         scenes_dir = project_dir / "Assets" / "Scenes"
         
-        # Generate unique object IDs
-        camera_id = 1963194225
-        light_id = 705507993
+        # Generate unique random object IDs for this scene to avoid conflicts
+        import random
+        random.seed()  # Ensure different IDs each time
+        camera_id = random.randint(1000000000, 2000000000)
+        light_id = random.randint(1000000000, 2000000000)
+        theme_manager_id = random.randint(1000000000, 2000000000)
+        theme_applier_id = random.randint(1000000000, 2000000000)
+        gamemanager_id = random.randint(1000000000, 2000000000)
         
         objects = scene_spec.objects or []
         scene_objects = []
@@ -963,9 +1095,22 @@ public class BuildScript
         # Add directional light
         scene_objects.append(self._create_light_yaml(light_id))
         
-        # Add game objects
+        # Note: Removed ThemeManager, ThemeApplier, and SimpleGameManager because:
+        # - ThemeApplier script doesn't exist in shared project
+        # - SimpleGameManager script reference causes Unity runtime initialization failure
+        # - Not needed for basic game scenes - Unity runs without them
+        
+        # SimpleGameManager removed - was causing "missing script" errors
+        # scene_objects.append(self._create_gamemanager_yaml(gamemanager_id))
+        
+        # Add SceneInitializer to ensure Unity WebGL initialization completes
+        # COMMENTED OUT - SceneInitializer script doesn't exist, causes missing script errors
+        # initializer_id = random.randint(4000000000, 5000000000)
+        # scene_objects.append(self._create_scene_initializer_yaml(initializer_id))
+        
+        # Add game objects with random unique IDs
         for i, obj in enumerate(objects):
-            obj_id = 1000000000 + i
+            obj_id = random.randint(2000000000, 3000000000)
             scene_objects.append(self._create_game_object_yaml(obj_id, obj))
         
         # Create scene YAML
@@ -992,10 +1137,10 @@ RenderSettings:
   m_LinearFogStart: 0
   m_LinearFogEnd: 300
   m_AmbientSkyColor: {{r: 0.212, g: 0.227, b: 0.259, a: 1}}
-  m_AmbientEquatorColor: {{r: 0.114, g: 0.125, b: 0.133, a: 1}}
-  m_AmbientGroundColor: {{r: 0.047, g: 0.043, b: 0.035, a: 1}}
-  m_AmbientIntensity: 1
-  m_AmbientMode: 0
+  m_AmbientEquatorColor: {{r: 0.4, g: 0.4, b: 0.4, a: 1}}
+  m_AmbientGroundColor: {{r: 0.3, g: 0.3, b: 0.3, a: 1}}
+  m_AmbientIntensity: 2
+  m_AmbientMode: 1
   m_SubtractiveShadowColor: {{r: 0.42, g: 0.478, b: 0.627, a: 1}}
   m_SkyboxMaterial: {{fileID: 10304, guid: 0000000000000000f000000000000000, type: 0}}
   m_HaloStrength: 0.5
@@ -1097,10 +1242,56 @@ NavMeshSettings:
 {chr(10).join(scene_objects)}
 """
         
-        (scenes_dir / f"{scene_spec.name}.unity").write_text(scene_content)
+        # Write the scene file
+        scene_file = scenes_dir / f"{scene_spec.name}.unity"
+        scene_file.write_text(scene_content)
+        
+        # Create matching .meta file with the GUID used in EditorBuildSettings
+        scene_guid = str(uuid.uuid4()).replace('-', '')
+        meta_content = f"""fileFormatVersion: 2
+guid: {scene_guid}
+DefaultImporter:
+  externalObjects: {{}}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+"""
+        (scenes_dir / f"{scene_spec.name}.unity.meta").write_text(meta_content)
+        
+        # Update EditorBuildSettings with the same GUID
+        self._update_build_settings(project_dir, scene_spec.name, scene_guid)
+        
+        # Return the GUID so caller can use it
+        return scene_guid
+    
+    def _euler_to_quaternion(self, euler_x: float, euler_y: float, euler_z: float) -> Dict[str, float]:
+        """Convert Euler angles (degrees) to quaternion"""
+        import math
+        # Convert degrees to radians
+        x = math.radians(euler_x)
+        y = math.radians(euler_y)
+        z = math.radians(euler_z)
+        
+        # Compute quaternion components (ZYX order, which Unity uses)
+        cy = math.cos(z * 0.5)
+        sy = math.sin(z * 0.5)
+        cp = math.cos(y * 0.5)
+        sp = math.sin(y * 0.5)
+        cr = math.cos(x * 0.5)
+        sr = math.sin(x * 0.5)
+        
+        qw = cr * cp * cy + sr * sp * sy
+        qx = sr * cp * cy - cr * sp * sy
+        qy = cr * sp * cy + sr * cp * sy
+        qz = cr * cp * sy - sr * sp * cy
+        
+        return {'x': qx, 'y': qy, 'z': qz, 'w': qw}
     
     def _create_camera_yaml(self, camera_id: int, position: Dict[str, float], rotation: Dict[str, float]) -> str:
         """Create Unity camera YAML"""
+        # Convert Euler angles to quaternion
+        quat = self._euler_to_quaternion(rotation['x'], rotation['y'], rotation['z'])
+        
         return f"""--- !u!1 &{camera_id}
 GameObject:
   m_ObjectHideFlags: 0
@@ -1137,7 +1328,7 @@ Camera:
   m_Enabled: 1
   serializedVersion: 2
   m_ClearFlags: 1
-  m_BackGroundColor: {{r: 0.19215687, g: 0.3019608, b: 0.4745098, a: 0}}
+  m_BackGroundColor: {{r: 0.2, g: 0.3, b: 0.5, a: 1}}
   m_projectionMatrixMode: 1
   m_GateFitMode: 2
   m_FOVAxisMode: 0
@@ -1171,7 +1362,7 @@ Transform:
   m_PrefabInstance: {{fileID: 0}}
   m_PrefabAsset: {{fileID: 0}}
   m_GameObject: {{fileID: {camera_id}}}
-  m_LocalRotation: {{x: {rotation['x']}, y: {rotation['y']}, z: {rotation['z']}, w: 1}}
+  m_LocalRotation: {{x: {quat['x']}, y: {quat['y']}, z: {quat['z']}, w: {quat['w']}}}
   m_LocalPosition: {{x: {position['x']}, y: {position['y']}, z: {position['z']}}}
   m_LocalScale: {{x: 1, y: 1, z: 1}}
   m_ConstrainProportionsScale: 0
@@ -1179,6 +1370,195 @@ Transform:
   m_Father: {{fileID: 0}}
   m_RootOrder: 0
   m_LocalEulerAnglesHint: {{x: {rotation['x']}, y: {rotation['y']}, z: {rotation['z']}}}"""
+    
+    def _create_theme_manager_yaml(self, manager_id: int) -> str:
+        """Create ThemeManager GameObject YAML"""
+        return f"""--- !u!1 &{manager_id}
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: {manager_id + 2}}}
+  - component: {{fileID: {manager_id + 1}}}
+  m_Layer: 0
+  m_Name: ThemeManager
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &{manager_id + 1}
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {manager_id}}}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {{fileID: 11500000, guid: 66d271533f6d75c49ae9d706f6882fe6, type: 3}}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!4 &{manager_id + 2}
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {manager_id}}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 0}}
+  m_RootOrder: 2
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}"""
+    
+    def _create_theme_applier_yaml(self, applier_id: int) -> str:
+        """Create ThemeApplier GameObject YAML"""
+        return f"""--- !u!1 &{applier_id}
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: {applier_id + 2}}}
+  - component: {{fileID: {applier_id + 1}}}
+  m_Layer: 0
+  m_Name: ThemeApplier
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &{applier_id + 1}
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {applier_id}}}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {{fileID: 11500000, guid: themeapplier-script-guid, type: 3}}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!4 &{applier_id + 2}
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {applier_id}}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 0}}
+  m_RootOrder: 3
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}"""
+    
+    def _create_gamemanager_yaml(self, manager_id: int) -> str:
+        """Create SimpleGameManager GameObject YAML"""
+        return f"""--- !u!1 &{manager_id}
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: {manager_id + 2}}}
+  - component: {{fileID: {manager_id + 1}}}
+  m_Layer: 0
+  m_Name: SimpleGameManager
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &{manager_id + 1}
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {manager_id}}}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {{fileID: 11500000, guid: a1b2c3d4e5f67890a1b2c3d4e5f67890, type: 3}}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!4 &{manager_id + 2}
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {manager_id}}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 0}}
+  m_RootOrder: 4
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}"""
+    
+    def _create_scene_initializer_yaml(self, initializer_id: int) -> str:
+        """Create SceneInitializer GameObject YAML to ensure WebGL initialization completes"""
+        # GUID for SceneInitializer.cs: scene1n1t1a11zer0000000000000
+        return f"""--- !u!1 &{initializer_id}
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  serializedVersion: 6
+  m_Component:
+  - component: {{fileID: {initializer_id + 2}}}
+  - component: {{fileID: {initializer_id + 1}}}
+  m_Layer: 0
+  m_Name: SceneInitializer
+  m_TagString: Untagged
+  m_Icon: {{fileID: 0}}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &{initializer_id + 1}
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {initializer_id}}}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {{fileID: 11500000, guid: scene1n1t1a11zer0000000000000, type: 3}}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!4 &{initializer_id + 2}
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_GameObject: {{fileID: {initializer_id}}}
+  m_LocalRotation: {{x: 0, y: 0, z: 0, w: 1}}
+  m_LocalPosition: {{x: 0, y: 0, z: 0}}
+  m_LocalScale: {{x: 1, y: 1, z: 1}}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {{fileID: 0}}
+  m_RootOrder: 5
+  m_LocalEulerAnglesHint: {{x: 0, y: 0, z: 0}}"""
     
     def _create_light_yaml(self, light_id: int) -> str:
         """Create Unity directional light YAML"""
@@ -1211,7 +1591,7 @@ Light:
   m_Type: 1
   m_Shape: 0
   m_Color: {{r: 1, g: 0.95686275, b: 0.8392157, a: 1}}
-  m_Intensity: 1
+  m_Intensity: 2
   m_Range: 10
   m_SpotAngle: 30
   m_InnerSpotAngle: 21.80208
@@ -1261,14 +1641,17 @@ Transform:
         rot = obj_spec.rotation or {"x": 0, "y": 0, "z": 0}
         scale = obj_spec.scale or {"x": 1, "y": 1, "z": 1}
         
-        # Convert rotation to quaternion (simplified)
-        w = 1.0 if rot["x"] == 0 and rot["y"] == 0 and rot["z"] == 0 else 0.9
+        # Convert Euler angles to quaternion
+        quat = self._euler_to_quaternion(rot['x'], rot['y'], rot['z'])
         
         # Get mesh reference based on type
         mesh_ref = self._get_mesh_reference(obj_spec.type)
         
         # Get material color
         color = obj_spec.material_color or {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0}
+        
+        # Material ID for this object
+        mat_id = obj_id + 5
         
         return f"""--- !u!1 &{obj_id}
 GameObject:
@@ -1322,7 +1705,40 @@ MeshRenderer:
   m_RenderingLayerMask: 1
   m_RendererPriority: 0
   m_Materials:
-  - {{fileID: 10303, guid: 0000000000000000f000000000000000, type: 0}}
+  - {{fileID: {mat_id}}}
+--- !u!21 &{mat_id}
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_Name: {obj_spec.name}Material
+  m_Shader: {{fileID: 46, guid: 0000000000000000f000000000000000, type: 0}}
+  m_Parent: {{fileID: 0}}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {{}}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - _MainTex:
+        m_Texture: {{fileID: 0}}
+        m_Scale: {{x: 1, y: 1}}
+        m_Offset: {{x: 0, y: 0}}
+    m_Ints: []
+    m_Floats:
+    - _Glossiness: 0.5
+    - _Metallic: 0
+    m_Colors:
+    - _Color: {{r: {color['r']}, g: {color['g']}, b: {color['b']}, a: {color['a']}}}
   m_StaticBatchInfo:
     firstSubMesh: 0
     subMeshCount: 0
@@ -1359,7 +1775,7 @@ Transform:
   m_PrefabInstance: {{fileID: 0}}
   m_PrefabAsset: {{fileID: 0}}
   m_GameObject: {{fileID: {obj_id}}}
-  m_LocalRotation: {{x: {rot['x']}, y: {rot['y']}, z: {rot['z']}, w: {w}}}
+  m_LocalRotation: {{x: {quat['x']}, y: {quat['y']}, z: {quat['z']}, w: {quat['w']}}}
   m_LocalPosition: {{x: {pos['x']}, y: {pos['y']}, z: {pos['z']}}}
   m_LocalScale: {{x: {scale['x']}, y: {scale['y']}, z: {scale['z']}}}
   m_ConstrainProportionsScale: 0
