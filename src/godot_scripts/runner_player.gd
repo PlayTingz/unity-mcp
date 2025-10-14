@@ -26,10 +26,10 @@ func _process(delta: float):
 	
 	# Handle input
 	if Input.is_action_just_pressed("move_left") or Input.is_action_just_pressed("ui_left"):
-		move_lane(false)
+		move_lane(true)
 	
 	if Input.is_action_just_pressed("move_right") or Input.is_action_just_pressed("ui_right"):
-		move_lane(true)
+		move_lane(false)
 	
 	if Input.is_action_just_pressed("jump") or Input.is_action_just_pressed("ui_up"):
 		if is_grounded:
