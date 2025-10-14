@@ -398,29 +398,44 @@ progressive_web_app/background_color=Color(0, 0, 0, 1)
     
     def _copy_theme_assets(self, project_dir: Path, theme_name: str):
         """Copy theme assets (FBX models and textures) into project"""
-        theme_source = Path(f"/opt/godot-themes/{theme_name}")
-        if not theme_source.exists():
-            self.logger.warning(f"Theme directory not found: {theme_source}")
-            return
-        
-        theme_dest = project_dir / "assets" / "themes" / theme_name
-        theme_dest.mkdir(parents=True, exist_ok=True)
-        
         import shutil
         
-        if (theme_source / "models").exists():
-            models_dest = theme_dest / "models"
-            models_dest.mkdir(parents=True, exist_ok=True)
-            for model_file in (theme_source / "models").glob("*.fbx"):
-                shutil.copy2(model_file, models_dest / model_file.name)
-                self.logger.info(f"Copied model: {model_file.name}")
+        # Try multiple possible asset locations
+        possible_sources = [
+            Path(f"/opt/godot-assets/{theme_name}"),
+            Path(f"/opt/godot-themes/{theme_name}"),
+            Path.home() / f"godot-assets/{theme_name}"
+        ]
         
-        if (theme_source / "textures").exists():
-            textures_dest = theme_dest / "textures"
-            textures_dest.mkdir(parents=True, exist_ok=True)
-            for texture_file in (theme_source / "textures").glob("*.png"):
-                shutil.copy2(texture_file, textures_dest / texture_file.name)
-                self.logger.info(f"Copied texture: {texture_file.name}")
+        theme_source = None
+        for source in possible_sources:
+            if source.exists():
+                theme_source = source
+                self.logger.info(f"Found theme assets at: {theme_source}")
+                break
+        
+        if not theme_source:
+            self.logger.warning(f"Theme directory not found in any location")
+            return
+        
+        # Copy to assets/city directory for direct access
+        assets_dest = project_dir / "assets" / theme_name
+        assets_dest.mkdir(parents=True, exist_ok=True)
+        
+        # Copy FBX models
+        for model_file in theme_source.glob("*.fbx"):
+            shutil.copy2(model_file, assets_dest / model_file.name)
+            self.logger.info(f"Copied model: {model_file.name}")
+        
+        # Copy GLB models
+        for model_file in theme_source.glob("*.glb"):
+            shutil.copy2(model_file, assets_dest / model_file.name)
+            self.logger.info(f"Copied GLB model: {model_file.name}")
+        
+        # Copy textures if they exist
+        for texture_file in theme_source.glob("*.png"):
+            shutil.copy2(texture_file, assets_dest / texture_file.name)
+            self.logger.info(f"Copied texture: {texture_file.name}")
     
     def _create_game_scripts(self, project_dir: Path, scripts: List[str]):
         """Create game scripts in GDScript"""
