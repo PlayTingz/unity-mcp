@@ -84,3 +84,8 @@ func activate_multiplier(multiplier: int, duration: float):
 func game_over():
 	print("Game Over! Final Score:", int(score), " Coins:", coins_collected)
 	world_speed = 0
+	
+	# Show game over UI
+	var ui = get_node_or_null("UI")
+	if ui and ui.has_method("show_game_over"):
+		ui.show_game_over(int(score), coins_collected)
