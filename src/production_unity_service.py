@@ -45,7 +45,7 @@ except ImportError:
     UnityBuildRequest = unity_build_service.BuildRequest
 
 # Configuration
-API_KEY = "013e283d7f3a2d45dcdbe7a2b4676a61ff58e7a576930ac3ea66c85d3882f197"
+API_KEY = "j_QJTDk9IfuxWh1G_jqjdLBeLBLuLyaFepi-6Rtfwkg"
 UNITY_PATH = "/opt/unity/Unity"
 BUILD_BASE_DIR = "/opt/unity-mcp/builds"
 GAME_BASE_URL = "http://35.226.93.88/games"
