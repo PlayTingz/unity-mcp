@@ -9,13 +9,83 @@ var active_segments: Array = []
 var next_spawn_z: float = 0.0
 var game_manager = null
 
+var road_model = null
+var barrel_model = null
+var cone_model = null
+var city_props: Array = []
+var city_texture = null
+var city_material = null
+
 func _ready():
 	print("Level Generator ready")
 	game_manager = get_parent()
 	
+	# Try to preload city models
+	load_city_models()
+	
 	# Spawn initial segments
 	for i in range(segments_on_screen):
 		spawn_segment()
+
+func load_city_models():
+	# Try to load FBX models from assets directory
+	var road_path = "res://assets/city/Env_Road_Straight_01.fbx"
+	var barrel_path = "res://assets/city/Prop_OilBerrel_01.fbx"
+	var cone_path = "res://assets/city/Prop_RoadCone_01.fbx"
+	
+	if ResourceLoader.exists(road_path):
+		road_model = load(road_path)
+		print("Loaded road model")
+	else:
+		print("Road model not found at:", road_path)
+	
+	if ResourceLoader.exists(barrel_path):
+		barrel_model = load(barrel_path)
+		city_props.append(barrel_model)
+		print("Loaded barrel model")
+	else:
+		print("Barrel model not found at:", barrel_path)
+	
+	if ResourceLoader.exists(cone_path):
+		cone_model = load(cone_path)
+		city_props.append(cone_model)
+		print("Loaded cone model")
+	else:
+		print("Cone model not found at:", cone_path)
+	
+	if city_props.size() == 0:
+		print("No city models found, using primitives")
+	
+	# Load texture and create material
+	var texture_path = "res://assets/city/PandaMat.png"
+	if ResourceLoader.exists(texture_path):
+		city_texture = load(texture_path)
+		city_material = StandardMaterial3D.new()
+		city_material.albedo_texture = city_texture
+		city_material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		print("Loaded PandaMat texture and created material")
+	else:
+		print("Texture not found at:", texture_path)
+		# Create default colorful material
+		city_material = StandardMaterial3D.new()
+		city_material.albedo_color = Color(0.8, 0.6, 0.4)
+
+func apply_material_to_mesh_instances(node: Node):
+	# Recursively apply material to all MeshInstance3D nodes
+	if node is MeshInstance3D and city_material:
+		for i in range(node.get_surface_override_material_count()):
+			node.set_surface_override_material(i, city_material)
+	
+	for child in node.get_children():
+		apply_material_to_mesh_instances(child)
+
+func load_city_road_model():
+	return road_model
+
+func load_random_city_prop():
+	if city_props.size() > 0:
+		return city_props[randi() % city_props.size()]
+	return null
 
 func _process(_delta: float):
 	# Move segments backward based on world speed
@@ -56,18 +126,28 @@ func create_track_segment() -> Node3D:
 	var segment = Node3D.new()
 	segment.name = "TrackSegment"
 	
-	# Create ground plane
-	var ground = MeshInstance3D.new()
-	var mesh = BoxMesh.new()
-	mesh.size = Vector3(12, 0.2, segment_length)
-	ground.mesh = mesh
-	
-	var material = StandardMaterial3D.new()
-	material.albedo_color = Color(0.3, 0.3, 0.3)
-	ground.set_surface_override_material(0, material)
-	ground.position = Vector3(0, -0.1, segment_length / 2)
-	
-	segment.add_child(ground)
+	# Try to load real road model, fallback to primitive
+	var road_scene = load_city_road_model()
+	if road_scene:
+		var road_instance = road_scene.instantiate()
+		road_instance.position = Vector3(0, 0, segment_length / 2)
+		road_instance.rotation_degrees = Vector3(0, 90, 0)
+		road_instance.scale = Vector3(2.0, 1.0, 2.0)
+		apply_material_to_mesh_instances(road_instance)
+		segment.add_child(road_instance)
+	else:
+		# Fallback to primitive ground
+		var ground = MeshInstance3D.new()
+		var mesh = BoxMesh.new()
+		mesh.size = Vector3(12, 0.2, segment_length)
+		ground.mesh = mesh
+		
+		var material = StandardMaterial3D.new()
+		material.albedo_color = Color(0.3, 0.3, 0.3)
+		ground.set_surface_override_material(0, material)
+		ground.position = Vector3(0, -0.1, segment_length / 2)
+		
+		segment.add_child(ground)
 	
 	# Randomly add lane markers
 	if randf() > 0.5:
@@ -153,16 +233,24 @@ func create_obstacle() -> StaticBody3D:
 	var obstacle = StaticBody3D.new()
 	obstacle.add_to_group("obstacle")
 	
-	# Visual mesh
-	var mesh_instance = MeshInstance3D.new()
-	var box = BoxMesh.new()
-	box.size = Vector3(1.5, 1.5, 1.5)
-	mesh_instance.mesh = box
-	
-	var material = StandardMaterial3D.new()
-	material.albedo_color = Color(0.8, 0.2, 0.2)  # Red
-	mesh_instance.set_surface_override_material(0, material)
-	obstacle.add_child(mesh_instance)
+	# Try to load random city prop model
+	var prop_scene = load_random_city_prop()
+	if prop_scene:
+		var prop_instance = prop_scene.instantiate()
+		prop_instance.scale = Vector3(1.5, 1.5, 1.5)
+		apply_material_to_mesh_instances(prop_instance)
+		obstacle.add_child(prop_instance)
+	else:
+		# Fallback to primitive box
+		var mesh_instance = MeshInstance3D.new()
+		var box = BoxMesh.new()
+		box.size = Vector3(1.5, 1.5, 1.5)
+		mesh_instance.mesh = box
+		
+		var material = StandardMaterial3D.new()
+		material.albedo_color = Color(0.8, 0.2, 0.2)  # Red
+		mesh_instance.set_surface_override_material(0, material)
+		obstacle.add_child(mesh_instance)
 	
 	# Collision shape
 	var collision = CollisionShape3D.new()
